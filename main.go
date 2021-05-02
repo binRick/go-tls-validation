@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net"
 	"strconv"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/k0kubun/pp"
+	"github.com/mgutz/ansi"
 )
 
 const (
@@ -52,6 +52,11 @@ var (
 			return err
 		},
 	}
+	red    = ansi.ColorCode("red+hu:black")
+	lime   = ansi.ColorCode("green+hb:black")
+	yellow = ansi.ColorCode("yellow+h:black")
+	reset  = ansi.ColorCode("reset")
+	brk    = "\n"
 )
 
 type sigAlgSunset struct {
@@ -87,33 +92,33 @@ type certErrors struct {
 	errs       []error
 }
 
-type checked_host_port_result struct {
+type HostPortCheckResult struct {
 	Port       int64
 	Host       string
 	Connected  bool
 	DurationMs int64
 	Dialed     string
+	certs      []certErrors
+	err        error
 }
 
-type hostResult struct {
+type HostCheckResult struct {
 	host               string
-	err                error
-	certs              []certErrors
 	open_ports         []int
-	checked_host_ports []*checked_host_port_result
+	checked_host_ports []*HostPortCheckResult
 }
 
-func checkHost(host string) (result hostResult) {
-	result = hostResult{
+func checkHost(host string) (result HostCheckResult) {
+	result = HostCheckResult{
 		host:               host,
-		certs:              []certErrors{},
 		open_ports:         []int{},
-		checked_host_ports: []*checked_host_port_result{},
+		checked_host_ports: []*HostPortCheckResult{},
 	}
 	for _, check_port := range ports_to_check {
-		cp := &checked_host_port_result{
+		cp := &HostPortCheckResult{
 			Host:   host,
 			Port:   check_port,
+			certs:  []certErrors{},
 			Dialed: fmt.Sprintf("%s:%d", host, check_port),
 		}
 		started := time.Now()
@@ -121,7 +126,7 @@ func checkHost(host string) (result hostResult) {
 		cp.DurationMs = time.Since(started).Milliseconds()
 		if err != nil {
 			cp.Connected = false
-			result.err = err
+			cp.err = err
 		} else {
 			cp.Connected = true
 			conn.Close()
@@ -146,7 +151,7 @@ func checkHost(host string) (result hostResult) {
 							}
 						}
 
-						result.certs = append(result.certs, certErrors{
+						cp.certs = append(cp.certs, certErrors{
 							commonName: cert.Subject.CommonName,
 							errs:       cErrs,
 						})
@@ -162,7 +167,7 @@ func checkHost(host string) (result hostResult) {
 	return
 }
 
-func processQueue(done <-chan struct{}, hosts <-chan string, results chan<- hostResult) {
+func processQueue(done <-chan struct{}, hosts <-chan string, results chan<- HostCheckResult) {
 	for host := range hosts {
 		select {
 		case results <- checkHost(host):
@@ -211,6 +216,18 @@ func main() {
 
 type StrSlice []string
 
+func ok_msg(s string) {
+	fmt.Print(brk, lime, s, reset)
+}
+
+func debug_msg(s string) {
+	fmt.Print(brk, yellow, s, reset, brk)
+}
+
+func err_msg(s string) {
+	fmt.Print(brk, red, s, reset, brk)
+}
+
 func (list StrSlice) Has(a string) bool {
 	for _, b := range list {
 		if b == a {
@@ -225,7 +242,7 @@ func processHosts() {
 	done := make(chan struct{})
 	defer close(done)
 	hosts := queueHosts(done)
-	results := make(chan hostResult)
+	results := make(chan HostCheckResult)
 	var wg sync.WaitGroup
 
 	wg.Add(*concurrency)
@@ -254,27 +271,35 @@ func processHosts() {
 			checked_hosts_qty = checked_hosts_qty + 1
 			checked_hosts = append(checked_hosts, r.host)
 		}
-		checked_ports_qty = checked_ports_qty + 1
-		if r.err != nil {
-			log.Printf("Host %s Connection Error: %v\n", r.host, r.err)
-		} else {
-			connected_ports_qty = connected_ports_qty + 1
-			for cq, cert := range r.certs {
-				checked_certs_qty = checked_certs_qty + 1
-				ns := pp.Sprintf("\n      %s\n", cert)
-				if DEBUG_MODE {
-					fmt.Printf("	[processHosts] cert #%d: %s\n", cq, ns)
-				}
-				for _, err := range cert.errs {
-					found_cert_errs_qty = found_cert_errs_qty + 1
-					log.Printf("  %s :: Certificate Error (CN:%s): %s\n", r.host, cert.commonName, err.Error())
+		for _, checked_host_port := range r.checked_host_ports {
+			checked_ports_qty = checked_ports_qty + 1
+			if checked_host_port.err != nil {
+				msg := fmt.Sprintf("Host %s Connection Error: %v\n", r.host, checked_host_port.err)
+				err_msg(msg)
+			} else {
+				connected_ports_qty = connected_ports_qty + 1
+				for cq, cert := range checked_host_port.certs {
+					checked_certs_qty = checked_certs_qty + 1
+					ns := pp.Sprintf("\n      %s\n", cert)
+					if DEBUG_MODE {
+						msg := fmt.Sprintf("	[processHosts] cert #%d: %s\n", cq, ns)
+						debug_msg(msg)
+					}
+					for _, err := range cert.errs {
+						found_cert_errs_qty = found_cert_errs_qty + 1
+						msg := fmt.Sprintf("%s :: Certificate Error (CN:%s): %s\n", checked_host_port.Host, cert.commonName, err.Error())
+						err_msg(msg)
+					}
 				}
 			}
 		}
 	}
+
 	dur := time.Since(started)
-	msg := fmt.Sprintf("\n ** Found %d Issues from %d results among %d certs from %d/%d ports and %d hosts in %dms.\n", found_cert_errs_qty, results_qty, checked_certs_qty, connected_ports_qty, checked_ports_qty, checked_hosts_qty, dur.Milliseconds())
-	fmt.Printf("%s\n", msg)
+	msg := fmt.Sprintf("\n\n ** Found %d Issues from %d results among %d certs from %d/%d ports and %d hosts in %dms.\n", found_cert_errs_qty, results_qty, checked_certs_qty, connected_ports_qty, checked_ports_qty, checked_hosts_qty, dur.Milliseconds())
+
+	fmt.Print(lime, msg, reset)
+
 }
 
 func queueHosts(done <-chan struct{}) <-chan string {
