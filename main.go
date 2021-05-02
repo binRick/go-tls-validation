@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,20 +22,21 @@ const (
 	errExpiringShortly = "%s: ** '%s' (S/N %X) expires in %d hours! **"
 	errExpiringSoon    = "%s: '%s' (S/N %X) expires in roughly %d days."
 	errSunsetAlg       = "%s: '%s' (S/N %X) expires after the sunset date for its signature algorithm '%s'."
+	DEFAULT_PORTS_CSV  = `443,`
 )
 
 var (
-	DEBUG_MODE  = defaultDebugMode
-	debugMode   = flag.Bool("debug", DEBUG_MODE, "Enable Debug Mode.")
-	hostsFile   = flag.String("hosts", "", "The path to the file containing a list of hosts to check.")
-	warnYears   = flag.Int("years", 0, "Warn if the certificate will expire within this many years.")
-	warnMonths  = flag.Int("months", 0, "Warn if the certificate will expire within this many months.")
-	warnDays    = flag.Int("days", 0, "Warn if the certificate will expire within this many days.")
-	checkSigAlg = flag.Bool("check-sig-alg", true, "Verify that non-root certificates are using a good signature algorithm.")
-	//	DEBUG_MODE            = flag.Bool("debug", defaultDebugMode, "Enable Debug mode")
-	concurrency = flag.Int("concurrency", defaultConcurrency, "Maximum number of hosts to check at once.")
+	ports_to_check = []int64{}
+	DEBUG_MODE     = defaultDebugMode
+	debugMode      = flag.Bool("debug", DEBUG_MODE, "Enable Debug Mode.")
+	hostsFile      = flag.String("hosts", "", "The path to the file containing a list of hosts to check.")
+	portsCsv       = flag.String("ports", DEFAULT_PORTS_CSV, "Comma Seperated list of ports to check.")
+	warnYears      = flag.Int("years", 0, "Warn if the certificate will expire within this many years.")
+	warnMonths     = flag.Int("months", 0, "Warn if the certificate will expire within this many months.")
+	warnDays       = flag.Int("days", 0, "Warn if the certificate will expire within this many days.")
+	checkSigAlg    = flag.Bool("check-sig-alg", true, "Verify that non-root certificates are using a good signature algorithm.")
+	concurrency    = flag.Int("concurrency", defaultConcurrency, "Maximum number of hosts to check at once.")
 
-	ports_to_check        = []int{443}
 	DIAL_TIMEOUT          = 1 * time.Second
 	tls_connection_config = &tls.Config{
 		InsecureSkipVerify: true,
@@ -86,7 +88,7 @@ type certErrors struct {
 }
 
 type checked_host_port_result struct {
-	Port       int
+	Port       int64
 	Host       string
 	Connected  bool
 	DurationMs int64
@@ -114,7 +116,6 @@ func checkHost(host string) (result hostResult) {
 			Port:   check_port,
 			Dialed: fmt.Sprintf("%s:%d", host, check_port),
 		}
-		result.checked_host_ports = append(result.checked_host_ports, cp)
 		started := time.Now()
 		conn, err := net.DialTimeout("tcp", cp.Dialed, DIAL_TIMEOUT)
 		cp.DurationMs = time.Since(started).Milliseconds()
@@ -156,6 +157,7 @@ func checkHost(host string) (result hostResult) {
 				}
 			}
 		}
+		result.checked_host_ports = append(result.checked_host_ports, cp)
 	}
 	return
 }
@@ -173,6 +175,13 @@ func processQueue(done <-chan struct{}, hosts <-chan string, results chan<- host
 func main() {
 	flag.Parse()
 	DEBUG_MODE = *debugMode
+
+	for _, p := range strings.Split(*portsCsv, `,`) {
+		pi, err := strconv.ParseInt(p, 10, 0)
+		if err == nil && pi > 0 && pi < 65536 {
+			ports_to_check = append(ports_to_check, pi)
+		}
+	}
 
 	if len(*hostsFile) == 0 {
 		fmt.Print("Must specify host file path\n")
@@ -200,6 +209,17 @@ func main() {
 
 }
 
+type StrSlice []string
+
+func (list StrSlice) Has(a string) bool {
+	for _, b := range list {
+		if b == a {
+			return true
+		}
+	}
+	return false
+}
+
 func processHosts() {
 	started := time.Now()
 	done := make(chan struct{})
@@ -221,33 +241,39 @@ func processHosts() {
 		close(results)
 	}()
 
+	checked_hosts := StrSlice{}
 	checked_hosts_qty := 0
 	checked_certs_qty := 0
 	found_cert_errs_qty := 0
+	connected_ports_qty := 0
+	checked_ports_qty := 0
+	results_qty := 0
 	for r := range results {
-		checked_hosts_qty = checked_hosts_qty + 1
-		R := pp.Sprintf("\n      %s\n", r)
-		if DEBUG_MODE {
-			fmt.Printf("	[processHosts] Result: %s\n", R)
+		results_qty = results_qty + 1
+		if !checked_hosts.Has(r.host) {
+			checked_hosts_qty = checked_hosts_qty + 1
+			checked_hosts = append(checked_hosts, r.host)
 		}
+		checked_ports_qty = checked_ports_qty + 1
 		if r.err != nil {
 			log.Printf("Host %s Connection Error: %v\n", r.host, r.err)
-			continue
-		}
-		for cq, cert := range r.certs {
-			checked_certs_qty = checked_certs_qty + 1
-			ns := pp.Sprintf("\n      %s\n", cert)
-			if DEBUG_MODE {
-				fmt.Printf("	[processHosts] cert #%d: %s\n", cq, ns)
-			}
-			for _, err := range cert.errs {
-				found_cert_errs_qty = found_cert_errs_qty + 1
-				log.Printf("  %s :: Certificate Error (CN:%s): %s\n", r.host, cert.commonName, err.Error())
+		} else {
+			connected_ports_qty = connected_ports_qty + 1
+			for cq, cert := range r.certs {
+				checked_certs_qty = checked_certs_qty + 1
+				ns := pp.Sprintf("\n      %s\n", cert)
+				if DEBUG_MODE {
+					fmt.Printf("	[processHosts] cert #%d: %s\n", cq, ns)
+				}
+				for _, err := range cert.errs {
+					found_cert_errs_qty = found_cert_errs_qty + 1
+					log.Printf("  %s :: Certificate Error (CN:%s): %s\n", r.host, cert.commonName, err.Error())
+				}
 			}
 		}
 	}
 	dur := time.Since(started)
-	msg := fmt.Sprintf("\n ** Found %d errors among %d certs from %d hosts in %dms\n", found_cert_errs_qty, checked_certs_qty, checked_hosts_qty, dur.Milliseconds())
+	msg := fmt.Sprintf("\n ** Found %d Issues from %d results among %d certs from %d/%d ports and %d hosts in %dms.\n", found_cert_errs_qty, results_qty, checked_certs_qty, connected_ports_qty, checked_ports_qty, checked_hosts_qty, dur.Milliseconds())
 	fmt.Printf("%s\n", msg)
 }
 
